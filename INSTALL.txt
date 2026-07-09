@@ -1,0 +1,124 @@
+═══════════════════════════════════════════════════════════
+    NETFLIX AUTO REGISTER BOT V2.0 - INSTALLATION GUIDE
+═══════════════════════════════════════════════════════════
+
+📋 REQUIREMENTS:
+- Node.js v16 atau lebih baru
+- Internet connection
+- Windows/Linux/Mac OS
+
+═══════════════════════════════════════════════════════════
+🚀 CARA INSTALL (WINDOWS):
+═══════════════════════════════════════════════════════════
+
+1. Buka Command Prompt (CMD) di folder ini
+
+2. Install dependencies:
+   npm install
+
+3. Install Playwright browser (Chromium):
+   npx playwright install chromium
+
+4. SELESAI! Ready to run.
+
+═══════════════════════════════════════════════════════════
+▶️ CARA JALANKAN:
+═══════════════════════════════════════════════════════════
+
+Di CMD, ketik:
+   node bot.js
+
+Muncul menu:
+   1. Auto Register Only       → Register sampai "Choose Plan"
+   2. Auto Register + Paid     → Coming Soon
+   0. Exit                     → Keluar
+
+Pilih 1 untuk auto register.
+
+Kemudian pilih jumlah thread (1-10):
+   Berapa thread yang ingin dijalankan? (1-10): 3
+
+Bot akan membuka 3 browser sekaligus dan register 3 akun parallel!
+
+REKOMENDASI THREAD:
+   - PC Low-end: 1-2 thread
+   - PC Medium: 3-5 thread
+   - PC High-end: 5-10 thread
+
+═══════════════════════════════════════════════════════════
+📊 OUTPUT:
+═══════════════════════════════════════════════════════════
+
+File result.txt berisi:
+   [Thread #X] email|password_mailtm|verification_link
+
+Contoh (3 thread):
+   [Thread #1] admin123@web-library.net|Admin123@|https://www.netflix.com/epr?code=AAA#no_ul
+   [Thread #2] admin456@web-library.net|Admin123@|https://www.netflix.com/epr?code=BBB#no_ul
+   [Thread #3] admin789@web-library.net|Admin123@|https://www.netflix.com/epr?code=CCC#no_ul
+
+═══════════════════════════════════════════════════════════
+🔍 FLOW BOT:
+═══════════════════════════════════════════════════════════
+
+[1/8] Generate email Mail.TM (admin{3digit}@web-library.net)
+[2/8] Loop cari promo 30 HARI ONLY (max 20x, fast retry 500ms)
+      - Promo 30 days ✅ LANJUT
+      - Promo 14 days ❌ SKIP, retry (500ms)
+      - Promo 7 days ❌ SKIP, retry (500ms)
+      - Tidak dapat ❌ SKIP, retry (500ms)
+[3/8] Isi email di Netflix
+[4/8] Klik button "Try 30 Days for IDR 0"
+[5/8] Klik "Send Link"
+[6/8] Tunggu email verifikasi (max 3 menit)
+[7/8] Buka link & klik "Create Your Account"
+[8/8] Stop di halaman "Choose your plan"
+
+⚡ SPEED OPTIMIZATIONS:
+   - Page timeout: 30s (down from 60s)
+   - Load wait: 1500ms (down from 3000ms)
+   - Retry delay: 500ms (down from 2000ms)
+   - Multi-threading: 1-10 concurrent threads
+
+═══════════════════════════════════════════════════════════
+⚠️ NOTES:
+═══════════════════════════════════════════════════════════
+
+- Bot akan membuka browser (headless: false)
+- Bot HANYA ambil promo 30 hari (skip 7/14 hari)
+- Multi-threading: 1-10 thread bisa berjalan bersamaan
+- Fast retry: 500ms (4x lebih cepat!)
+- Promo tergantung region/IP Netflix
+- Email Mail.TM kadang slow (max 3 menit)
+- Jika error, lihat error_screenshot_threadX_*.png
+
+═══════════════════════════════════════════════════════════
+❌ TROUBLESHOOTING:
+═══════════════════════════════════════════════════════════
+
+ERROR: "npm not found"
+→ Install Node.js dari https://nodejs.org
+
+ERROR: "Tidak menemukan promo setelah 15 percobaan"
+→ Promo 30 hari tidak tersedia, coba pakai VPN atau tunggu
+
+ERROR: "Email tidak diterima dalam 3 menit"
+→ Mail.TM sedang slow, coba lagi atau tunggu lebih lama
+
+ERROR: "Button tidak ditemukan"
+→ Netflix update UI, hubungi developer
+
+═══════════════════════════════════════════════════════════
+📧 SUPPORT:
+═══════════════════════════════════════════════════════════
+
+Jika ada error:
+1. Check error_screenshot_*.png
+2. Check error_page_*.html
+3. Kirim screenshot error ke developer
+
+═══════════════════════════════════════════════════════════
+✅ READY TO USE!
+═══════════════════════════════════════════════════════════
+
+Happy botting! 🤖

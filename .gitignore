@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Results
+result.txt
+
+# Error files
+error_screenshot_*.png
+error_page_*.html
+
+# Playwright
+.playwright/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
