@@ -165,13 +165,8 @@ async function runBot(mode, threadId = 1) {
     console.log(`Mode: ${mode === 1 ? 'Auto Register Only' : 'Auto Register + Paid Gopay'}\n`);
     
     const browser = await chromium.launch({
-        headless: true, // Browser tidak muncul
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-blink-features=AutomationControlled'
-        ],
+        headless: false,
+        args: ['--no-sandbox', '--disable-setuid-sandbox'],
     });
     
     const context = await browser.newContext({
@@ -392,7 +387,10 @@ async function runBot(mode, threadId = 1) {
         }
 
     } catch (error) {
-        // Silent error - tidak tampilkan error message
+        console.error(`\n=== ❌ THREAD #${threadId} - ERROR ===`);
+        console.error(`Message: ${error.message}`);
+        console.error(`Stack: ${error.stack}\n`);
+        
         const timestamp = Date.now();
         const screenshotPath = `error_screenshot_thread${threadId}_${timestamp}.png`;
         const htmlPath = `error_page_thread${threadId}_${timestamp}.html`;
@@ -401,10 +399,15 @@ async function runBot(mode, threadId = 1) {
             await page.screenshot({ path: screenshotPath, fullPage: true });
             const html = await page.content();
             await fs.writeFile(htmlPath, html, 'utf-8');
+            
+            console.log(`Screenshot: ${screenshotPath}`);
+            console.log(`HTML: ${htmlPath}`);
         } catch (saveError) {
-            // Ignore save error
+            console.error('Gagal menyimpan error file:', saveError.message);
         }
     } finally {
+        console.log(`\n[Thread #${threadId}] Menutup browser dalam 10 detik...`);
+        await new Promise(resolve => setTimeout(resolve, 10000));
         await browser.close();
     }
 }
