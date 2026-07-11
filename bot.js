@@ -8,6 +8,62 @@ const readline = require('readline');
 const HERO_SMS_API_KEY = '26314967c74A49d227f553c54419cc9f';
 const HERO_SMS_BASE_URL = 'https://hero-sms.com/stubs/handler_api.php';
 
+// ixBrowser Cookies untuk Mode 3
+// Paste cookies dari ixBrowser atau Cookie Editor di sini (format JSON array)
+const IX_BROWSER_COOKIES = [
+    {
+        "domain": ".netflix.com",
+        "hostOnly": false,
+        "httpOnly": true,
+        "name": "netflix-mfa-nonce",
+        "path": "/",
+        "sameSite": "strict",
+        "secure": true,
+        "session": true,
+        "storeId": null,
+        "value": "BgjKu-vcAxKVAeVzzGfWptN1piahYGX7VhFTUJZxEJP8tFRkEKI7SYd8YDZP4AleM7zFCkjgQQygeA6jMW8Mjqh3rNYODwuG50MiEyX8q-4MXXmdC9u4YYdgFsBjDP3jMzPDHe6FCzKl3v6t6Z0jL_W0f8aQ3xgUinK_1nkCtqYYBKyMycQiX5nZNeceEX-L7A3FgxgZGOSf8Pn9HxJjGAYiDgoMFN3niWeVcdSho_NW"
+    },
+    {
+        "domain": ".netflix.com",
+        "expirationDate": 1815275948,
+        "hostOnly": false,
+        "httpOnly": true,
+        "name": "SecureNetflixId",
+        "path": "/",
+        "sameSite": "strict",
+        "secure": true,
+        "session": false,
+        "storeId": null,
+        "value": "v%3D3%26mac%3DAQEAEQABABRq1Kf0X2wjsDrvvM8wb0ejoAxYvmKso1A.%26dt%3D1783739822623"
+    },
+    {
+        "domain": ".netflix.com",
+        "expirationDate": 1783826348,
+        "hostOnly": false,
+        "httpOnly": true,
+        "name": "gsid",
+        "path": "/",
+        "sameSite": "no_restriction",
+        "secure": true,
+        "session": false,
+        "storeId": null,
+        "value": "0fdd44b0-0b0d-4480-b899-1669c2e8fd1f"
+    },
+    {
+        "domain": ".netflix.com",
+        "expirationDate": 1815275948,
+        "hostOnly": false,
+        "httpOnly": true,
+        "name": "NetflixId",
+        "path": "/",
+        "sameSite": "lax",
+        "secure": true,
+        "session": false,
+        "storeId": null,
+        "value": "v%3D3%26ct%3DBgjHlOvcAxLbAc4ts4mUKDJ8g9BLj_fSy4H1Bq3nVzOx2623hEo_uvL1ajCpun_VKLwrqDps7EeMZQl1mpFdb73wBndLWJ5xb6uUibonCE6kfOmX9FD7WyJubJ9qeV01M4sll078Tw16YzleoZvHITR4rUE1N73A3HYdZ6zELZE5TvnpUG5sWHVybhsD5qf0Nppg1KHyGjdbsopzHC3xBTDRkzlIw3lONJ1y4kkGoUu6ZMwCTqN4BnO-1e3CGI53dzoilIHM8xYyOxXmgUH9ZZ3e2Au0iqvu3FLVV6xtt1ct9kteahgGIg4KDNNksU_yoPAXOsIrFQ.."
+    }
+];
+
 // --- Interface untuk input user ---
 const rl = readline.createInterface({
     input: process.stdin,
@@ -16,6 +72,53 @@ const rl = readline.createInterface({
 
 function askQuestion(query) {
     return new Promise(resolve => rl.question(query, resolve));
+}
+
+// --- Converter ixBrowser Cookies ke Playwright Format ---
+function convertIxBrowserCookies(ixCookies) {
+    return ixCookies.map(cookie => {
+        // Deteksi format cookies (Cookie Editor vs ixBrowser)
+        let sameSite = 'None';
+        
+        if (typeof cookie.sameSite === 'string') {
+            // Format Cookie Editor: "strict", "lax", "no_restriction"
+            if (cookie.sameSite === 'strict') {
+                sameSite = 'Strict';
+            } else if (cookie.sameSite === 'lax') {
+                sameSite = 'Lax';
+            } else if (cookie.sameSite === 'no_restriction') {
+                sameSite = 'None';
+            }
+        } else if (typeof cookie.same_site === 'number') {
+            // Format ixBrowser: -1/0 = None, 1 = Lax, 2 = Strict
+            if (cookie.same_site === 1) {
+                sameSite = 'Lax';
+            } else if (cookie.same_site === 2) {
+                sameSite = 'Strict';
+            }
+        }
+        
+        // Handle expires
+        let expires = -1;
+        if (cookie.expirationDate) {
+            // Cookie Editor format (Unix timestamp)
+            expires = cookie.expirationDate;
+        } else if (cookie.expiration_time) {
+            // ixBrowser format
+            expires = cookie.expiration_time;
+        }
+        
+        return {
+            name: cookie.name,
+            value: cookie.value,
+            domain: cookie.domain,
+            path: cookie.path || '/',
+            expires: expires,
+            httpOnly: cookie.httpOnly || cookie.http_only || false,
+            secure: cookie.secure || false,
+            sameSite: sameSite
+        };
+    });
 }
 
 // --- Hero SMS API Functions ---
@@ -522,9 +625,14 @@ async function checkNetflixPromo(page) {
 
 async function runBot(mode, threadId = 1, selectedPlan = 'Mobile') {
     console.log(`\n=== NETFLIX BOT #${threadId} - START ===\n`);
-    console.log(`Mode: ${mode === 1 ? 'Auto Register Only' : 'Auto Register + Paid Gopay'}\n`);
-    if (mode === 2) {
+    
+    if (mode === 1) {
+        console.log(`Mode: Auto Register Only\n`);
+    } else if (mode === 2) {
+        console.log(`Mode: Auto Register + Paid Gopay\n`);
         console.log(`Paket: ${selectedPlan}\n`);
+    } else if (mode === 3) {
+        console.log(`Mode: With ixBrowser Cookies (No Promo Check, No Gopay)\n`);
     }
     
     const browser = await chromium.launch({
@@ -535,6 +643,18 @@ async function runBot(mode, threadId = 1, selectedPlan = 'Mobile') {
     const context = await browser.newContext({
         viewport: { width: 1280, height: 800 }
     });
+    
+    // MODE 3: Load ixBrowser cookies
+    if (mode === 3) {
+        if (!IX_BROWSER_COOKIES || IX_BROWSER_COOKIES.length === 0) {
+            throw new Error('IX_BROWSER_COOKIES kosong! Paste cookies dari ixBrowser di bagian atas file.');
+        }
+        
+        console.log(`[*] Loading ${IX_BROWSER_COOKIES.length} cookies dari ixBrowser...\n`);
+        const playwrightCookies = convertIxBrowserCookies(IX_BROWSER_COOKIES);
+        await context.addCookies(playwrightCookies);
+        console.log(`[+] ✅ Cookies berhasil dimuat!\n`);
+    }
     
     const page = await context.newPage();
 
@@ -557,46 +677,62 @@ async function runBot(mode, threadId = 1, selectedPlan = 'Mobile') {
         console.log(`Token   : ${mailToken.substring(0, 20)}...`);
         console.log(`====================\n`);
 
-        // --- Step 2: Cari Netflix dengan Promo 30 HARI ---
-        console.log(`[Thread #${threadId}] [2/8] 🔍 MENCARI PROMO NETFLIX (TARGET: 30 HARI)\n`);
-        console.log('     ⚠️  Bot hanya akan ambil promo 30 hari');
-        console.log('     ⚠️  Promo 7 atau 14 hari akan di-SKIP\n');
-        
-        let promoFound = false;
-        let attempts = 0;
-        const maxAttempts = 20; // Naikkan ke 20x
-        
-        while (!promoFound && attempts < maxAttempts) {
-            attempts++;
-            console.log(`[Thread #${threadId}] [*] Percobaan #${attempts}/${maxAttempts} - Membuka Netflix...`);
+        // --- MODE 3: SKIP PROMO CHECK ---
+        if (mode === 3) {
+            console.log(`[Thread #${threadId}] [2/8] 🚀 MODE 3: SKIP PROMO CHECK (Using Cookies)\n`);
+            console.log('[*] Langsung ke Netflix homepage dengan cookies...\n');
             
-            await page.goto('https://www.netflix.com/clearcookies', { 
+            await page.goto('https://www.netflix.com/', { 
                 waitUntil: 'domcontentloaded',
-                timeout: 30000 // Kurangi timeout 60s → 30s
+                timeout: 30000
             });
             
-            // Kurangi wait time: 3000ms → 1500ms
-            await page.waitForTimeout(1500);
+            await page.waitForTimeout(3000);
+            console.log('[+] Netflix homepage loaded dengan cookies\n');
             
-            const promoCheck = await checkNetflixPromo(page);
+            // Langsung ke Step 3: Isi Email (skip promo check)
+        } else {
+            // --- Step 2: Cari Netflix dengan Promo 30 HARI (Mode 1 & 2) ---
+            console.log(`[Thread #${threadId}] [2/8] 🔍 MENCARI PROMO NETFLIX (TARGET: 30 HARI)\n`);
+            console.log('     ⚠️  Bot hanya akan ambil promo 30 hari');
+            console.log('     ⚠️  Promo 7 atau 14 hari akan di-SKIP\n');
             
-            if (promoCheck.hasPromo && promoCheck.days === 30) {
-                console.log(`[+] ✅ PROMO 30 HARI DITEMUKAN!`);
-                console.log(`[+] Banner: ${promoCheck.text}\n`);
-                promoFound = true;
-            } else {
-                if (promoCheck.days === 14 || promoCheck.days === 7) {
-                    console.log(`[-] Promo ${promoCheck.days} hari di-skip, retry...\n`);
+            let promoFound = false;
+            let attempts = 0;
+            const maxAttempts = 20; // Naikkan ke 20x
+            
+            while (!promoFound && attempts < maxAttempts) {
+                attempts++;
+                console.log(`[Thread #${threadId}] [*] Percobaan #${attempts}/${maxAttempts} - Membuka Netflix...`);
+                
+                await page.goto('https://www.netflix.com/clearcookies', { 
+                    waitUntil: 'domcontentloaded',
+                    timeout: 30000 // Kurangi timeout 60s → 30s
+                });
+                
+                // Kurangi wait time: 3000ms → 1500ms
+                await page.waitForTimeout(1500);
+                
+                const promoCheck = await checkNetflixPromo(page);
+                
+                if (promoCheck.hasPromo && promoCheck.days === 30) {
+                    console.log(`[+] ✅ PROMO 30 HARI DITEMUKAN!`);
+                    console.log(`[+] Banner: ${promoCheck.text}\n`);
+                    promoFound = true;
                 } else {
-                    console.log(`[-] Promo tidak tersedia, retry...\n`);
+                    if (promoCheck.days === 14 || promoCheck.days === 7) {
+                        console.log(`[-] Promo ${promoCheck.days} hari di-skip, retry...\n`);
+                    } else {
+                        console.log(`[-] Promo tidak tersedia, retry...\n`);
+                    }
+                    // Kurangi delay retry: 2000ms → 500ms
+                    await page.waitForTimeout(500);
                 }
-                // Kurangi delay retry: 2000ms → 500ms
-                await page.waitForTimeout(500);
             }
-        }
-        
-        if (!promoFound) {
-            throw new Error('Tidak menemukan promo 30 hari setelah ' + maxAttempts + ' percobaan');
+            
+            if (!promoFound) {
+                throw new Error('Tidak menemukan promo 30 hari setelah ' + maxAttempts + ' percobaan');
+            }
         }
 
         // --- Step 3: Isi Email ---
@@ -728,6 +864,18 @@ async function runBot(mode, threadId = 1, selectedPlan = 'Mobile') {
         await page.waitForTimeout(3000);
         const finalUrl = page.url();
         console.log(`[*] Final URL: ${finalUrl}`);
+        
+        // MODE 3: Skip plan selection & payment
+        if (mode === 3) {
+            console.log(`\n=== ✅ THREAD #${threadId} - SELESAI (MODE 3 - COOKIES ONLY) ===`);
+            console.log(`Email Netflix: ${emailAddress}`);
+            console.log(`Password Mail.TM: ${emailPassword}`);
+            console.log(`Verification Link: ${verificationLink}`);
+            console.log(`Data tersimpan di: result.txt\n`);
+            console.log('[*] Mode 3: Cookies-based - No payment, No promo check');
+            console.log('[*] Akun sudah terverifikasi dengan cookies\n');
+            return; // Exit early untuk mode 3
+        }
         
         if (mode === 1) {
             console.log(`\n=== ✅ THREAD #${threadId} - PROSES SELESAI (AUTO REGISTER ONLY)! ===`);
@@ -1243,47 +1391,50 @@ async function main() {
     console.log('║     NETFLIX AUTO REGISTER BOT        ║');
     console.log('╚═══════════════════════════════════════╝\n');
     console.log('Pilih mode:');
-    console.log('1. Auto Register Only');
-    console.log('2. Auto Register + Paid Gopay (Coming Soon)');
+    console.log('1. Auto Register Only (TIDAK BISA - Promo habis)');
+    console.log('2. Auto Register + Paid Gopay (TIDAK BISA - Promo habis)');
+    console.log('3. With ixBrowser Cookies (Mail.TM + Netflix only)');
     console.log('0. Exit\n');
     
-    const choice = await askQuestion('Pilihan Anda (1/2/0): ');
+    const choice = await askQuestion('Pilihan Anda (1/2/3/0): ');
     
     if (choice === '0') {
         console.log('\n[*] Terima kasih! Bot ditutup.');
         rl.close();
         process.exit(0);
     } else if (choice === '1' || choice === '2') {
-        const mode = parseInt(choice);
-        let selectedPlan = 'Mobile'; // Default
+        console.log('\n[!] Mode 1 dan 2 TIDAK TERSEDIA!');
+        console.log('[!] Promo Netflix 30 hari sudah habis.');
+        console.log('[!] Gunakan Mode 3 dengan cookies ixBrowser.\n');
+        rl.close();
+        process.exit(0);
+    } else if (choice === '3') {
+        const mode = 3;
         
-        if (mode === 2) {
-            console.log('\n[!] Fitur Auto Register + Gopay Payment siap digunakan!');
-            console.log('[*] Bot akan otomatis registrasi Gopay menggunakan Hero SMS API\n');
-            
-            // Pilih paket Netflix
-            console.log('Pilih paket Netflix:');
-            console.log('1. Mobile (480p) - IDR 54,000/bulan');
-            console.log('2. Basic (720p) - IDR 65,000/bulan');
-            console.log('3. Standard (1080p) - IDR 120,000/bulan');
-            console.log('4. Premium (4K+HDR) - IDR 186,000/bulan\n');
-            
-            const planChoice = await askQuestion('Pilih paket (1/2/3/4) [default: 1]: ');
-            const planMapping = {
-                '1': 'Mobile',
-                '2': 'Basic',
-                '3': 'Standard',
-                '4': 'Premium'
-            };
-            selectedPlan = planMapping[planChoice] || 'Mobile';
-            console.log(`[*] Paket terpilih: ${selectedPlan}\n`);
-            
-            const confirm = await askQuestion('Lanjutkan? (y/n): ');
-            if (confirm.toLowerCase() !== 'y') {
-                rl.close();
-                console.log('[*] Dibatalkan.');
-                process.exit(0);
-            }
+        console.log('\n[*] Mode 3: ixBrowser Cookies');
+        console.log('[*] Bot akan:');
+        console.log('    1. Load cookies dari ixBrowser');
+        console.log('    2. Buat email Mail.TM');
+        console.log('    3. Registrasi Netflix dengan email');
+        console.log('    4. Verifikasi email');
+        console.log('    5. SKIP promo check & payment\n');
+        
+        // Check apakah cookies sudah diisi
+        if (!IX_BROWSER_COOKIES || IX_BROWSER_COOKIES.length === 0) {
+            console.log('[!] ❌ ERROR: IX_BROWSER_COOKIES kosong!');
+            console.log('[!] Silakan paste cookies dari ixBrowser di bagian atas file bot.js');
+            console.log('[!] Cari baris: const IX_BROWSER_COOKIES = [...]\n');
+            rl.close();
+            process.exit(1);
+        }
+        
+        console.log(`[+] Cookies ditemukan: ${IX_BROWSER_COOKIES.length} items\n`);
+        
+        const confirm = await askQuestion('Lanjutkan? (y/n): ');
+        if (confirm.toLowerCase() !== 'y') {
+            rl.close();
+            console.log('[*] Dibatalkan.');
+            process.exit(0);
         }
         
         // Tanya jumlah thread
@@ -1299,20 +1450,14 @@ async function main() {
         
         rl.close();
         
-        console.log(`\n[*] Menjalankan ${threadCount} thread...\n`);
+        console.log(`\n[*] Menjalankan ${threadCount} thread dengan Mode 3...\n`);
         
         // Jalankan bot dengan multi-threading
         const promises = [];
         for (let i = 1; i <= threadCount; i++) {
             // Delay antar thread agar tidak bentrok
             await new Promise(resolve => setTimeout(resolve, 2000 * (i - 1)));
-            
-            // Pass selectedPlan hanya jika mode 2
-            if (mode === 2) {
-                promises.push(runBot(mode, i, selectedPlan));
-            } else {
-                promises.push(runBot(mode, i));
-            }
+            promises.push(runBot(mode, i));
         }
         
         // Tunggu semua thread selesai
