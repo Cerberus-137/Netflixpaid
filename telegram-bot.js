@@ -8,17 +8,32 @@ const { chromium } = require('playwright');
 const axios = require('axios');
 const fs = require('fs').promises;
 const fsSync = require('fs');
+const mysql = require('mysql2/promise');
 
 // ===== KONFIGURASI =====
 const BOT_TOKEN = '8557661156:AAG49v40J15F140lI4CAba8Ypx0E_uy8_M8';
 const ADMIN_USER_ID = null; // Set ke Telegram User ID Anda untuk admin access (optional)
 const DEFAULT_PASSWORD = 'NetflixTrial2025!'; // Password default untuk mode generate
 
-// Database sederhana: menyimpan user yang sudah pake trial
+// MySQL Database Configuration
+const DB_CONFIG = {
+    host: 'localhost',
+    user: 'root', // atau user database Anda
+    password: 'Milham159753',
+    database: 'netflix_bot', // nama database yang akan dibuat
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
+};
+
+// Database sederhana fallback: menyimpan user yang sudah pake trial
 const DB_FILE = './telegram_users.json';
 
 // User state management (untuk multi-step interactions)
 const userStates = new Map(); // userId -> { mode, data, step }
+
+// MySQL Pool
+let dbPool = null;
 
 // Cookies 30 days - SAMA PERSIS seperti netflix-mass-bot.js
 const COOKIES_30_DAYS = [
@@ -32,7 +47,246 @@ const COOKIES_30_DAYS = [
     {"domain":".netflix.com","name":"netflix-sans-bold-3-loaded","value":"true","path":"/","secure":false,"httpOnly":false,"sameSite":"Lax"}
 ];
 
-// ===== DATABASE FUNCTIONS =====
+// ===== DATABASE FUNCTIONS (MySQL + JSON Fallback) =====
+
+// Initialize MySQL Database
+async function initDatabase() {
+    try {
+        // Create connection pool
+        dbPool = mysql.createPool(DB_CONFIG);
+        
+        console.log('[*] Testing MySQL connection...');
+        const connection = await dbPool.getConnection();
+        
+        // Create database if not exists
+        await connection.query(`CREATE DATABASE IF NOT EXISTS ${DB_CONFIG.database}`);
+        await connection.query(`USE ${DB_CONFIG.database}`);
+        
+        // Create users table
+        await connection.query(`
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_id BIGINT PRIMARY KEY,
+                username VARCHAR(255),
+                credit INT DEFAULT 2,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            )
+        `);
+        
+        // Create transactions table
+        await connection.query(`
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                telegram_id BIGINT,
+                type ENUM('netflix', 'topup', 'redeem') DEFAULT 'netflix',
+                email VARCHAR(255),
+                password VARCHAR(255),
+                link TEXT,
+                credit_used INT DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
+            )
+        `);
+        
+        // Create redeem_codes table
+        await connection.query(`
+            CREATE TABLE IF NOT EXISTS redeem_codes (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                code VARCHAR(50) UNIQUE,
+                credit_value INT,
+                used_by BIGINT DEFAULT NULL,
+                used_at TIMESTAMP NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (used_by) REFERENCES users(telegram_id)
+            )
+        `);
+        
+        // Insert default redeem codes
+        await connection.query(`
+            INSERT IGNORE INTO redeem_codes (code, credit_value) VALUES
+            ('WELCOME10', 10),
+            ('TRIAL5', 5),
+            ('BONUS3', 3)
+        `);
+        
+        connection.release();
+        console.log('[+] MySQL database initialized successfully!');
+        return true;
+    } catch (error) {
+        console.error('[-] MySQL connection failed:', error.message);
+        console.log('[!] Falling back to JSON database...');
+        return false;
+    }
+}
+
+// Get user from database
+async function getUser(telegramId, username) {
+    if (dbPool) {
+        try {
+            const [rows] = await dbPool.query(
+                'SELECT * FROM users WHERE telegram_id = ?',
+                [telegramId]
+            );
+            
+            if (rows.length === 0) {
+                // Create new user
+                await dbPool.query(
+                    'INSERT INTO users (telegram_id, username, credit) VALUES (?, ?, 2)',
+                    [telegramId, username]
+                );
+                return { telegram_id: telegramId, username, credit: 2 };
+            }
+            
+            return rows[0];
+        } catch (error) {
+            console.error('[-] MySQL error:', error.message);
+        }
+    }
+    
+    // Fallback to JSON
+    const db = loadDatabase();
+    if (!db.users[telegramId]) {
+        db.users[telegramId] = {
+            username: username,
+            credit: 2,
+            timestamp: new Date().toISOString(),
+            history: []
+        };
+        saveDatabase(db);
+    }
+    return db.users[telegramId];
+}
+
+// Update user credit
+async function updateCredit(telegramId, creditChange) {
+    if (dbPool) {
+        try {
+            await dbPool.query(
+                'UPDATE users SET credit = credit + ? WHERE telegram_id = ?',
+                [creditChange, telegramId]
+            );
+            return true;
+        } catch (error) {
+            console.error('[-] MySQL error:', error.message);
+        }
+    }
+    
+    // Fallback to JSON
+    const db = loadDatabase();
+    if (db.users[telegramId]) {
+        db.users[telegramId].credit += creditChange;
+        saveDatabase(db);
+        return true;
+    }
+    return false;
+}
+
+// Add transaction
+async function addTransaction(telegramId, type, email, password, link, creditUsed = 1) {
+    if (dbPool) {
+        try {
+            await dbPool.query(
+                'INSERT INTO transactions (telegram_id, type, email, password, link, credit_used) VALUES (?, ?, ?, ?, ?, ?)',
+                [telegramId, type, email, password, link, creditUsed]
+            );
+            return true;
+        } catch (error) {
+            console.error('[-] MySQL error:', error.message);
+        }
+    }
+    
+    // Fallback to JSON
+    const db = loadDatabase();
+    if (!db.users[telegramId].history) {
+        db.users[telegramId].history = [];
+    }
+    db.users[telegramId].history.push({
+        type, email, password, link,
+        timestamp: new Date().toISOString()
+    });
+    saveDatabase(db);
+    return true;
+}
+
+// Get user history
+async function getUserHistory(telegramId, limit = 5) {
+    if (dbPool) {
+        try {
+            const [rows] = await dbPool.query(
+                'SELECT * FROM transactions WHERE telegram_id = ? ORDER BY created_at DESC LIMIT ?',
+                [telegramId, limit]
+            );
+            return rows;
+        } catch (error) {
+            console.error('[-] MySQL error:', error.message);
+        }
+    }
+    
+    // Fallback to JSON
+    const db = loadDatabase();
+    const history = db.users[telegramId]?.history || [];
+    return history.slice(-limit).reverse();
+}
+
+// Redeem code
+async function redeemCode(telegramId, code) {
+    if (dbPool) {
+        try {
+            const [rows] = await dbPool.query(
+                'SELECT * FROM redeem_codes WHERE code = ? AND used_by IS NULL',
+                [code]
+            );
+            
+            if (rows.length === 0) {
+                return { success: false, message: 'Kode tidak valid atau sudah digunakan' };
+            }
+            
+            const creditValue = rows[0].credit_value;
+            
+            // Mark as used
+            await dbPool.query(
+                'UPDATE redeem_codes SET used_by = ?, used_at = NOW() WHERE code = ?',
+                [telegramId, code]
+            );
+            
+            // Add credit
+            await updateCredit(telegramId, creditValue);
+            
+            return { success: true, creditValue };
+        } catch (error) {
+            console.error('[-] MySQL error:', error.message);
+        }
+    }
+    
+    // Fallback to JSON
+    const validCodes = {
+        'WELCOME10': 10,
+        'TRIAL5': 5,
+        'BONUS3': 3
+    };
+    
+    if (validCodes[code]) {
+        const db = loadDatabase();
+        const userData = db.users[telegramId];
+        
+        if (userData.redeemedCodes && userData.redeemedCodes.includes(code)) {
+            return { success: false, message: 'Kode sudah digunakan' };
+        }
+        
+        if (!userData.redeemedCodes) {
+            userData.redeemedCodes = [];
+        }
+        userData.redeemedCodes.push(code);
+        userData.credit += validCodes[code];
+        saveDatabase(db);
+        
+        return { success: true, creditValue: validCodes[code] };
+    }
+    
+    return { success: false, message: 'Kode tidak valid' };
+}
+
+// JSON Database Functions (Fallback)
 function loadDatabase() {
     try {
         if (fsSync.existsSync(DB_FILE)) {
@@ -524,7 +778,7 @@ bot.onText(/\/start/, (msg) => {
     const userData = db.users[userId];
     
     const welcomeMessage = `
-👋 *Selamat datang di RECONIX Bot*
+👋 *Selamat datang di  Bot*
 
 🆔 Telegram: \`${userId}\`
 🔗 Akun Web: \`${username}\` ✅
@@ -664,21 +918,44 @@ bot.on('callback_query', async (callbackQuery) => {
     const userData = db.users[userId] || { credit: 0, history: [] };
     
     if (data === 'menu_fitur') {
-        // Fitur Menu
+        // Fitur Menu dengan 5 Opsi
         const fiturMsg = `
 🎬 *FITUR - Netflix Generator*
 
-Pilih layanan yang kamu mau:
-
 💰 Saldo kamu: *${userData.credit} kredit*
 
-_1 Generate Netflix = 1 Kredit_
+Pilih layanan yang kamu mau:
+
+*1.* Manual Email (FREE)
+→ Input email sendiri
+
+*2.* Generate Email (FREE)
+→ Auto-generate Mail.TM + password default
+
+*3.* Auto Register + Claim (1 Kredit)
+→ Full automation dengan verify
+
+*4.* Mass Email Manual (FREE)
+→ Paste list email (max 10)
+
+*5.* Mass Email Generator (FREE)
+→ Generate multiple emails (max 10)
+
+_Mode berbayar: Auto Register + Claim_
         `;
         
         const keyboard = {
             inline_keyboard: [
                 [
-                    { text: '🎲 Generate Netflix', callback_data: 'fitur_netflix' }
+                    { text: '📝 Manual Email', callback_data: 'fitur_manual' },
+                    { text: '🎲 Generate Email', callback_data: 'fitur_generate' }
+                ],
+                [
+                    { text: '🚀 Auto Register + Claim', callback_data: 'fitur_auto' }
+                ],
+                [
+                    { text: '📋 Mass Manual', callback_data: 'fitur_mass_manual' },
+                    { text: '⚡ Mass Generator', callback_data: 'fitur_mass_gen' }
                 ],
                 [
                     { text: '🔙 Kembali', callback_data: 'back_main' }
@@ -690,6 +967,164 @@ _1 Generate Netflix = 1 Kredit_
             parse_mode: 'Markdown',
             reply_markup: keyboard
         });
+    }
+    
+    else if (data === 'fitur_manual') {
+        // Mode 1: Manual Email (FREE)
+        userStates.set(userId, { mode: 'manual', step: 1 });
+        bot.sendMessage(chatId,
+            `📝 *Mode: Manual Email* (FREE)\n\n` +
+            `Silakan kirim email Anda:\n` +
+            `Contoh: user@gmail.com\n\n` +
+            `Bot akan submit ke Netflix, lalu cek inbox untuk verifikasi.`,
+            { parse_mode: 'Markdown' }
+        );
+    }
+    
+    else if (data === 'fitur_generate') {
+        // Mode 2: Generate Email (FREE)
+        bot.sendMessage(chatId,
+            `🎲 *Generating Email...* (FREE)\n\n` +
+            `Password default: \`${DEFAULT_PASSWORD}\`\n\n` +
+            `Mohon tunggu...`,
+            { parse_mode: 'Markdown' }
+        );
+        
+        try {
+            const result = await generateMailTmOnly();
+            
+            if (result.success) {
+                const successMsg = `
+✅ *Email Generated!*
+
+📧 *Email:* \`${result.email}\`
+🔑 *Password:* \`${DEFAULT_PASSWORD}\`
+
+📝 *Next:*
+1. Cek inbox: ${result.email}
+2. Klik link verifikasi Netflix
+3. Login dengan password di atas
+
+Format:
+\`\`\`
+${result.email}|${DEFAULT_PASSWORD}
+\`\`\`
+                `;
+                
+                bot.sendMessage(chatId, successMsg, { parse_mode: 'Markdown' });
+                
+                // Log
+                const logData = `[${new Date().toISOString()}] Generate (FREE) | User: ${username} (${userId}) | Email: ${result.email}\n`;
+                await fs.appendFile('./telegram_bot_log.txt', logData);
+            }
+        } catch (error) {
+            bot.sendMessage(chatId,
+                `❌ Gagal: \`${error.message}\``,
+                { parse_mode: 'Markdown' }
+            );
+        }
+    }
+    
+    else if (data === 'fitur_auto') {
+        // Mode 3: Auto Register + Claim (PAID - 1 Kredit)
+        if (userData.credit < 1) {
+            bot.sendMessage(chatId,
+                `❌ *Saldo tidak cukup!*\n\n` +
+                `Mode ini butuh 1 kredit.\n` +
+                `Saldo kamu: ${userData.credit} kredit\n\n` +
+                `Silakan topup atau gunakan mode FREE!`,
+                { parse_mode: 'Markdown' }
+            );
+            return;
+        }
+        
+        const processingMsg = await bot.sendMessage(chatId,
+            `🚀 *Auto Register + Claim* (1 Kredit)\n\n` +
+            `⏱ Estimasi: 2-3 menit\n` +
+            `📧 Generate Mail.TM\n` +
+            `🌐 Register Netflix\n` +
+            `✅ Auto-verify\n\n` +
+            `Mohon tunggu... ☕`,
+            { parse_mode: 'Markdown' }
+        );
+        
+        try {
+            const result = await generateNetflixAccount();
+            
+            if (result.success) {
+                // Deduct credit
+                await updateCredit(userId, -1);
+                
+                // Add to transactions
+                await addTransaction(userId, 'netflix', result.email, result.password, result.verificationLink, 1);
+                
+                // Get updated credit
+                const updatedUser = await getUser(userId, username);
+                
+                const successMsg = `
+✅ *Netflix Account Created!*
+
+📧 *Email:* \`${result.email}\`
+🔑 *Password:* \`${result.password}\`
+🔗 *Link:*
+${result.verificationLink}
+
+💰 *Saldo:* ${updatedUser.credit} kredit
+
+📝 *Cara Pakai:*
+1. Klik link verifikasi
+2. Login dengan email & password
+3. Enjoy 30 hari gratis! 🎉
+
+Format:
+\`\`\`
+${result.email}|${result.password}|${result.verificationLink}
+\`\`\`
+                `;
+                
+                await bot.deleteMessage(chatId, processingMsg.message_id);
+                bot.sendMessage(chatId, successMsg, { parse_mode: 'Markdown' });
+                
+                // Log
+                const logData = `[${new Date().toISOString()}] Auto (PAID) | User: ${username} (${userId}) | Email: ${result.email} | Credit: ${updatedUser.credit}\n`;
+                await fs.appendFile('./telegram_bot_log.txt', logData);
+            }
+        } catch (error) {
+            await bot.deleteMessage(chatId, processingMsg.message_id);
+            bot.sendMessage(chatId,
+                `❌ *Gagal*\n\n` +
+                `Error: \`${error.message}\`\n\n` +
+                `Kredit TIDAK dikurangi. Silakan coba lagi!`,
+                { parse_mode: 'Markdown' }
+            );
+        }
+    }
+    
+    else if (data === 'fitur_mass_manual') {
+        // Mode 4: Mass Email Manual (FREE)
+        userStates.set(userId, { mode: 'mass_manual', step: 1 });
+        bot.sendMessage(chatId,
+            `📋 *Mass Email Manual* (FREE)\n\n` +
+            `Paste list email (1 per line):\n` +
+            `\`\`\`\n` +
+            `user1@gmail.com\n` +
+            `user2@yahoo.com\n` +
+            `user3@outlook.com\n` +
+            `\`\`\`\n\n` +
+            `Max: 10 emails`,
+            { parse_mode: 'Markdown' }
+        );
+    }
+    
+    else if (data === 'fitur_mass_gen') {
+        // Mode 5: Mass Email Generator (FREE)
+        userStates.set(userId, { mode: 'mass_gen', step: 1 });
+        bot.sendMessage(chatId,
+            `⚡ *Mass Email Generator* (FREE)\n\n` +
+            `Berapa email yang mau digenerate?\n\n` +
+            `Kirim angka (1-10)`,
+            { parse_mode: 'Markdown' }
+        );
     }
     
     else if (data === 'fitur_netflix') {
@@ -800,20 +1235,24 @@ _Email & password sudah tersimpan di Riwayat_
     
     else if (data === 'menu_riwayat') {
         // Riwayat/History Menu
+        const history = await getUserHistory(userId, 5);
+        
         let historyMsg = `📜 *RIWAYAT TRANSAKSI*\n\n`;
         
-        if (userData.history.length === 0) {
+        if (history.length === 0) {
             historyMsg += `Belum ada transaksi.`;
         } else {
-            const recentHistory = userData.history.slice(-5).reverse();
-            recentHistory.forEach((item, index) => {
-                historyMsg += `*${index + 1}.* Netflix\n`;
-                historyMsg += `📧 ${item.email}\n`;
-                historyMsg += `🔑 ${item.password}\n`;
-                historyMsg += `📅 ${new Date(item.timestamp).toLocaleString('id-ID')}\n\n`;
+            history.forEach((item, index) => {
+                historyMsg += `*${index + 1}.* ${item.type === 'netflix' ? 'Netflix' : item.type}\n`;
+                historyMsg += `📧 ${item.email || 'N/A'}\n`;
+                if (item.password) {
+                    historyMsg += `🔑 ${item.password}\n`;
+                }
+                const timestamp = item.created_at || item.timestamp;
+                historyMsg += `📅 ${new Date(timestamp).toLocaleString('id-ID')}\n\n`;
             });
             
-            if (userData.history.length > 5) {
+            if (history.length >= 5) {
                 historyMsg += `_Menampilkan 5 transaksi terakhir_`;
             }
         }
@@ -984,66 +1423,187 @@ bot.on('message', async (msg) => {
     
     const { mode, step, data } = userState;
     
-    // MODE: REDEEM
-    if (mode === 'redeem' && step === 1) {
-        const code = text.trim().toUpperCase();
+    // MODE 1: MANUAL EMAIL
+    if (mode === 'manual' && step === 1) {
+        const email = text.trim();
         
-        // Simple redeem code validation (customize dengan kode real Anda)
-        const validCodes = {
-            'WELCOME10': 10,
-            'TRIAL5': 5,
-            'BONUS3': 3
-        };
+        if (!email.includes('@') || !email.includes('.')) {
+            bot.sendMessage(chatId, '❌ Email tidak valid!');
+            return;
+        }
         
-        if (validCodes[code]) {
-            const creditBonus = validCodes[code];
+        bot.sendMessage(chatId, `📝 Processing: ${email}...`);
+        
+        try {
+            const result = await processManualEmail(email);
             
-            // Load database
-            const db = loadDatabase();
-            const userData = db.users[userId];
-            
-            // Check if code already redeemed
-            if (userData.redeemedCodes && userData.redeemedCodes.includes(code)) {
+            if (result.success) {
                 bot.sendMessage(chatId,
-                    `❌ *Kode sudah digunakan!*\n\n` +
-                    `Kode "${code}" sudah pernah kamu redeem sebelumnya.`,
-                    { parse_mode: 'Markdown' }
-                );
-            } else {
-                // Add credit
-                userData.credit += creditBonus;
-                
-                // Mark code as redeemed
-                if (!userData.redeemedCodes) {
-                    userData.redeemedCodes = [];
-                }
-                userData.redeemedCodes.push(code);
-                
-                // Save
-                db.users[userId] = userData;
-                saveDatabase(db);
-                
-                bot.sendMessage(chatId,
-                    `✅ *Redeem Berhasil!*\n\n` +
-                    `Kode: "${code}"\n` +
-                    `Bonus: +${creditBonus} kredit\n\n` +
-                    `💰 Saldo baru: *${userData.credit} kredit*\n\n` +
-                    `Selamat! 🎉`,
+                    `✅ *Berhasil!*\n\n` +
+                    `Email ${email} disubmit ke Netflix!\n\n` +
+                    `📬 Cek inbox untuk link verifikasi.`,
                     { parse_mode: 'Markdown' }
                 );
                 
-                // Log
-                const logData = `[${new Date().toISOString()}] Redeem | User: ${username} (${userId}) | Code: ${code} | Bonus: ${creditBonus}\n`;
+                const logData = `[${new Date().toISOString()}] Manual (FREE) | User: ${username} (${userId}) | Email: ${email}\n`;
                 await fs.appendFile('./telegram_bot_log.txt', logData);
             }
+        } catch (error) {
+            bot.sendMessage(chatId, `❌ Gagal: \`${error.message}\``, { parse_mode: 'Markdown' });
+        }
+        
+        userStates.delete(userId);
+    }
+    
+    // MODE: REDEEM
+    else if (mode === 'redeem' && step === 1) {
+        const code = text.trim().toUpperCase();
+        
+        const result = await redeemCode(userId, code);
+        
+        if (result.success) {
+            const updatedUser = await getUser(userId, username);
+            
+            bot.sendMessage(chatId,
+                `✅ *Redeem Berhasil!*\n\n` +
+                `Kode: "${code}"\n` +
+                `Bonus: +${result.creditValue} kredit\n\n` +
+                `💰 Saldo baru: *${updatedUser.credit} kredit*\n\n` +
+                `Selamat! 🎉`,
+                { parse_mode: 'Markdown' }
+            );
+            
+            const logData = `[${new Date().toISOString()}] Redeem | User: ${username} (${userId}) | Code: ${code} | Bonus: ${result.creditValue}\n`;
+            await fs.appendFile('./telegram_bot_log.txt', logData);
         } else {
             bot.sendMessage(chatId,
-                `❌ *Kode tidak valid!*\n\n` +
-                `Kode "${code}" tidak ditemukan atau sudah expired.\n\n` +
-                `Coba kode lain atau hubungi admin.`,
+                `❌ *${result.message}*\n\n` +
+                `Kode: "${code}"`,
                 { parse_mode: 'Markdown' }
             );
         }
+        
+        userStates.delete(userId);
+    }
+    
+    // MODE 4: MASS EMAIL MANUAL
+    else if (mode === 'mass_manual' && step === 1) {
+        const emails = text.trim().split('\n').map(e => e.trim()).filter(e => e);
+        
+        if (emails.length === 0) {
+            bot.sendMessage(chatId, '❌ Tidak ada email valid!');
+            return;
+        }
+        
+        if (emails.length > 10) {
+            bot.sendMessage(chatId, `❌ Maksimal 10 emails! (Anda kirim ${emails.length})`);
+            return;
+        }
+        
+        bot.sendMessage(chatId,
+            `📋 Processing ${emails.length} emails...\n\nMohon tunggu...`,
+            { parse_mode: 'Markdown' }
+        );
+        
+        let successCount = 0;
+        let failCount = 0;
+        const results = [];
+        
+        for (let i = 0; i < emails.length; i++) {
+            const email = emails[i];
+            
+            try {
+                bot.sendMessage(chatId, `[${i + 1}/${emails.length}] ${email}...`);
+                
+                const result = await processManualEmail(email);
+                
+                if (result.success) {
+                    successCount++;
+                    results.push(`✅ ${email}`);
+                } else {
+                    failCount++;
+                    results.push(`❌ ${email}`);
+                }
+            } catch (error) {
+                failCount++;
+                results.push(`❌ ${email}`);
+            }
+        }
+        
+        const summaryMsg = `
+📊 *Summary*
+
+Total: ${emails.length}
+✅ Success: ${successCount}
+❌ Failed: ${failCount}
+
+*Results:*
+${results.join('\n')}
+
+Cek inbox untuk link verifikasi! 📬
+        `;
+        
+        bot.sendMessage(chatId, summaryMsg, { parse_mode: 'Markdown' });
+        
+        const logData = `[${new Date().toISOString()}] Mass Manual (FREE) | User: ${username} (${userId}) | Total: ${emails.length} | Success: ${successCount}\n`;
+        await fs.appendFile('./telegram_bot_log.txt', logData);
+        
+        userStates.delete(userId);
+    }
+    
+    // MODE 5: MASS EMAIL GENERATOR
+    else if (mode === 'mass_gen' && step === 1) {
+        const count = parseInt(text.trim());
+        
+        if (isNaN(count) || count < 1 || count > 10) {
+            bot.sendMessage(chatId, '❌ Angka harus 1-10!');
+            return;
+        }
+        
+        bot.sendMessage(chatId,
+            `⚡ Generating ${count} emails...\n\nEstimasi: ${count * 1}-${count * 2} menit`,
+            { parse_mode: 'Markdown' }
+        );
+        
+        let successCount = 0;
+        const results = [];
+        
+        for (let i = 0; i < count; i++) {
+            try {
+                bot.sendMessage(chatId, `[${i + 1}/${count}] Generating...`);
+                
+                const result = await generateMailTmOnly();
+                
+                if (result.success) {
+                    successCount++;
+                    results.push(`✅ ${result.email}|${DEFAULT_PASSWORD}`);
+                }
+            } catch (error) {
+                results.push(`❌ Failed`);
+            }
+        }
+        
+        const summaryMsg = `
+📊 *Summary*
+
+Total: ${count}
+✅ Success: ${successCount}
+
+*Results:*
+\`\`\`
+${results.join('\n')}
+\`\`\`
+
+Password: \`${DEFAULT_PASSWORD}\`
+Format: email|password
+
+Cek inbox untuk verifikasi! 📬
+        `;
+        
+        bot.sendMessage(chatId, summaryMsg, { parse_mode: 'Markdown' });
+        
+        const logData = `[${new Date().toISOString()}] Mass Gen (FREE) | User: ${username} (${userId}) | Total: ${count} | Success: ${successCount}\n`;
+        await fs.appendFile('./telegram_bot_log.txt', logData);
         
         userStates.delete(userId);
     }
