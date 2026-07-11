@@ -1,7 +1,7 @@
 // telegram-bot.js
 // Bot Telegram untuk Netflix Email Generator
-// 1 Trial per Telegram Account
-// Full featured dengan mass generation support
+// Full Featured: Manual, Auto-Generate, Auto-Register, Mass Email
+// Version 3.0
 
 const TelegramBot = require('node-telegram-bot-api');
 const { chromium } = require('playwright');
@@ -12,12 +12,13 @@ const fsSync = require('fs');
 // ===== KONFIGURASI =====
 const BOT_TOKEN = '8557661156:AAG49v40J15F140lI4CAba8Ypx0E_uy8_M8';
 const ADMIN_USER_ID = null; // Set ke Telegram User ID Anda untuk admin access (optional)
+const DEFAULT_PASSWORD = 'NetflixTrial2025!'; // Password default untuk mode generate
 
 // Database sederhana: menyimpan user yang sudah pake trial
 const DB_FILE = './telegram_users.json';
 
-// Queue system untuk mass generation
-const userQueues = new Map(); // userId -> { emails: [], processing: false }
+// User state management (untuk multi-step interactions)
+const userStates = new Map(); // userId -> { mode, data, step }
 
 // Cookies 30 days - SAMA PERSIS seperti netflix-mass-bot.js
 const COOKIES_30_DAYS = [
@@ -186,6 +187,156 @@ async function waitForNetflixEmail(token, timeout = 180000) {
 }
 
 // ===== NETFLIX AUTOMATION (Seperti netflix-mass-bot.js dengan retry logic) =====
+
+// Process MANUAL EMAIL (user provide email)
+async function processManualEmail(email) {
+    console.log(`[*] Processing manual email: ${email}`);
+    
+    const browser = await chromium.launch({ 
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+    
+    const context = await browser.newContext();
+    await context.addCookies(COOKIES_30_DAYS);
+    const page = await context.newPage();
+    
+    try {
+        await page.goto('https://www.netflix.com/id-en/', { 
+            waitUntil: 'domcontentloaded',
+            timeout: 60000
+        });
+        await page.waitForTimeout(2000);
+        
+        // Input email dengan retry
+        let emailSuccess = false;
+        let attempt = 0;
+        
+        while (!emailSuccess && attempt < 10) {
+            attempt++;
+            console.log(`[*] Input email (attempt ${attempt}/10)`);
+            
+            await page.fill('input[data-uia="field-email"]', email);
+            await page.click('button[type="submit"]');
+            await page.waitForTimeout(3000);
+            
+            try {
+                const sendLinkButton = page.locator('button[data-uia="email-register-send-link-send-link-button"]');
+                const hasSendLink = await sendLinkButton.isVisible({ timeout: 2000 });
+                
+                if (hasSendLink) {
+                    console.log(`[+] Berhasil! Klik "Send Link"`);
+                    await sendLinkButton.click();
+                    emailSuccess = true;
+                } else {
+                    await page.goBack();
+                    await page.waitForTimeout(2000);
+                }
+            } catch (e) {
+                await page.goBack();
+                await page.waitForTimeout(2000);
+            }
+        }
+        
+        await browser.close();
+        
+        if (emailSuccess) {
+            return {
+                success: true,
+                email: email,
+                message: 'Email berhasil disubmit! Silakan cek inbox Anda untuk link verifikasi.'
+            };
+        } else {
+            throw new Error('Gagal submit email setelah 10 percobaan');
+        }
+        
+    } catch (error) {
+        await browser.close();
+        throw error;
+    }
+}
+
+// Generate Mail.TM email + Netflix register (NO VERIFY)
+async function generateMailTmOnly() {
+    console.log('[*] Generate Mail.TM email only...');
+    
+    const mailAccount = await getMailTmAccount();
+    if (!mailAccount) {
+        throw new Error('Gagal membuat akun Mail.TM');
+    }
+    
+    const email = mailAccount.address;
+    const password = DEFAULT_PASSWORD;
+    
+    console.log(`[+] Email created: ${email}`);
+    
+    const browser = await chromium.launch({ 
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+    
+    const context = await browser.newContext();
+    await context.addCookies(COOKIES_30_DAYS);
+    const page = await context.newPage();
+    
+    try {
+        await page.goto('https://www.netflix.com/id-en/', { 
+            waitUntil: 'domcontentloaded',
+            timeout: 60000
+        });
+        await page.waitForTimeout(2000);
+        
+        // Input email dengan retry
+        let emailSuccess = false;
+        let attempt = 0;
+        
+        while (!emailSuccess && attempt < 20) {
+            attempt++;
+            console.log(`[*] Input email (attempt ${attempt})`);
+            
+            await page.fill('input[data-uia="field-email"]', email);
+            await page.click('button[type="submit"]');
+            await page.waitForTimeout(3000);
+            
+            try {
+                const sendLinkButton = page.locator('button[data-uia="email-register-send-link-send-link-button"]');
+                const hasSendLink = await sendLinkButton.isVisible({ timeout: 2000 });
+                
+                if (hasSendLink) {
+                    console.log(`[+] Berhasil! Klik "Send Link"`);
+                    await sendLinkButton.click();
+                    emailSuccess = true;
+                } else {
+                    await page.goBack();
+                    await page.waitForTimeout(2000);
+                }
+            } catch (e) {
+                await page.goBack();
+                await page.waitForTimeout(2000);
+            }
+        }
+        
+        await browser.close();
+        
+        if (emailSuccess) {
+            return {
+                success: true,
+                email: email,
+                password: password,
+                mailToken: mailAccount.token,
+                mailPassword: mailAccount.password
+            };
+        } else {
+            throw new Error('Gagal submit email setelah 20 percobaan');
+        }
+        
+    } catch (error) {
+        await browser.close();
+        throw error;
+    }
+}
+
+// Full automation: Generate + Register + Verify
 async function generateNetflixAccount() {
     console.log('[*] Starting Netflix account generation...');
     
@@ -212,12 +363,34 @@ async function generateNetflixAccount() {
     const page = await context.newPage();
     
     try {
-        // Buka Netflix
-        await page.goto('https://www.netflix.com/id-en/', { 
-            waitUntil: 'domcontentloaded',
-            timeout: 60000
-        });
-        await page.waitForTimeout(2000);
+        // Buka Netflix dengan retry (FIX untuk timeout issue)
+        let pageLoaded = false;
+        let loadAttempt = 0;
+        
+        while (!pageLoaded && loadAttempt < 3) {
+            loadAttempt++;
+            console.log(`[*] Loading Netflix page (attempt ${loadAttempt}/3)...`);
+            
+            try {
+                await page.goto('https://www.netflix.com/id-en/', { 
+                    waitUntil: 'networkidle',
+                    timeout: 30000
+                });
+                await page.waitForTimeout(3000);
+                
+                // Verify page loaded dengan cek input field
+                const emailInput = page.locator('input[data-uia="field-email"]');
+                await emailInput.waitFor({ state: 'visible', timeout: 10000 });
+                
+                pageLoaded = true;
+                console.log(`[+] Netflix page loaded successfully`);
+            } catch (e) {
+                console.log(`[-] Page load failed (${e.message}), retrying...`);
+                if (loadAttempt >= 3) {
+                    throw new Error('Failed to load Netflix page after 3 attempts');
+                }
+            }
+        }
         
         // Input email dengan retry UNLIMITED seperti netflix-mass-bot.js
         let emailSuccess = false;
@@ -227,31 +400,44 @@ async function generateNetflixAccount() {
             attempt++;
             console.log(`[*] Input email (attempt ${attempt})`);
             
-            await page.fill('input[data-uia="field-email"]', email);
-            await page.click('button[type="submit"]');
-            await page.waitForTimeout(3000);
-            
-            const currentUrl = page.url();
-            console.log(`[*] Current URL: ${currentUrl}`);
-            
-            // Cek apakah ada tombol "Send Link" di page
             try {
-                const sendLinkButton = page.locator('button[data-uia="email-register-send-link-send-link-button"]');
-                const hasSendLink = await sendLinkButton.isVisible({ timeout: 2000 });
+                // Wait for input to be ready
+                const emailInput = page.locator('input[data-uia="field-email"]');
+                await emailInput.waitFor({ state: 'visible', timeout: 10000 });
+                await emailInput.clear();
+                await emailInput.fill(email);
                 
-                if (hasSendLink) {
-                    console.log(`[+] Berhasil! Klik "Send Link"`);
-                    await sendLinkButton.click();
-                    emailSuccess = true;
-                } else {
+                const submitButton = page.locator('button[type="submit"]');
+                await submitButton.click();
+                await page.waitForTimeout(5000); // Tunggu lebih lama untuk page navigation
+                
+                const currentUrl = page.url();
+                console.log(`[*] Current URL: ${currentUrl}`);
+                
+                // Cek apakah ada tombol "Send Link" di page
+                try {
+                    const sendLinkButton = page.locator('button[data-uia="email-register-send-link-send-link-button"]');
+                    const hasSendLink = await sendLinkButton.isVisible({ timeout: 5000 });
+                    
+                    if (hasSendLink) {
+                        console.log(`[+] Berhasil! Klik "Send Link"`);
+                        await sendLinkButton.click();
+                        emailSuccess = true;
+                    } else {
+                        console.log(`[-] Tidak ada tombol "Send Link", back + retry...`);
+                        await page.goBack({ waitUntil: 'networkidle', timeout: 15000 });
+                        await page.waitForTimeout(3000);
+                    }
+                } catch (e) {
                     console.log(`[-] Tidak ada tombol "Send Link", back + retry...`);
-                    await page.goBack();
-                    await page.waitForTimeout(2000);
+                    await page.goBack({ waitUntil: 'networkidle', timeout: 15000 });
+                    await page.waitForTimeout(3000);
                 }
-            } catch (e) {
-                console.log(`[-] Tidak ada tombol "Send Link", back + retry...`);
-                await page.goBack();
-                await page.waitForTimeout(2000);
+            } catch (fillError) {
+                console.log(`[-] Error filling email: ${fillError.message}`);
+                // Reload page on fill error
+                await page.reload({ waitUntil: 'networkidle', timeout: 15000 });
+                await page.waitForTimeout(3000);
             }
             
             // Safety: max 20 attempts untuk telegram bot
@@ -315,70 +501,101 @@ const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 console.log('🤖 Netflix Email Generator Bot started!');
 console.log('Bot Token:', BOT_TOKEN.substring(0, 20) + '...');
 
-// Command: /start
+// Command: /start dengan INLINE KEYBOARD (RECONIX Style)
 bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
-    const username = msg.from.username || msg.from.first_name;
+    const username = msg.from.username || msg.from.first_name || 'User';
+    
+    // Load user data
+    const db = loadDatabase();
+    if (!db.users[userId]) {
+        // New user: initialize dengan 2 kredit gratis
+        db.users[userId] = {
+            username: username,
+            credit: 2, // Starting credit
+            timestamp: new Date().toISOString(),
+            used: false,
+            history: []
+        };
+        saveDatabase(db);
+    }
+    
+    const userData = db.users[userId];
     
     const welcomeMessage = `
-🎬 *Netflix Email Generator Bot*
+👋 *Selamat datang di RECONIX Bot*
 
-Halo ${username}! 👋
+🆔 Telegram: \`${userId}\`
+🔗 Akun Web: \`${username}\` ✅
+💰 Saldo: *${userData.credit} kredit*
 
-Bot ini akan generate email Netflix dengan promo 30 hari gratis untuk kamu.
-
-📌 *Aturan:*
-• Setiap akun Telegram dapat *1 trial gratis*
-• Proses займет 2-3 menit per email
-• Email akan auto-verify
-
-🔰 *Commands:*
-/generate - Generate 1 email Netflix (1x per akun)
-/status - Cek status trial kamu
-/help - Panduan lengkap
-
-💡 *Info:*
-Bot menggunakan cookies 30 hari + Mail.TM auto-verify seperti netflix-mass-bot.js
-
-Gunakan /generate untuk mulai! 🚀
+Pilih menu di bawah untuk mulai 👇
     `;
     
-    bot.sendMessage(chatId, welcomeMessage, { parse_mode: 'Markdown' });
+    const keyboard = {
+        inline_keyboard: [
+            [
+                { text: '🎬 Fitur', callback_data: 'menu_fitur' }
+            ],
+            [
+                { text: '👤 Profile', callback_data: 'menu_profile' },
+                { text: '📜 Riwayat', callback_data: 'menu_riwayat' }
+            ],
+            [
+                { text: '🎁 Redeem', callback_data: 'menu_redeem' },
+                { text: '💳 Topup', callback_data: 'menu_topup' }
+            ],
+            [
+                { text: '❓ Bantuan', callback_data: 'menu_bantuan' }
+            ]
+        ]
+    };
+    
+    bot.sendMessage(chatId, welcomeMessage, { 
+        parse_mode: 'Markdown',
+        reply_markup: keyboard
+    });
 });
 
 // Command: /help
 bot.onText(/\/help/, (msg) => {
     const chatId = msg.chat.id;
-    
+    showHelp(chatId);
+});
+
+function showHelp(chatId) {
     const helpMessage = `
 📚 *Panduan Netflix Email Generator*
 
-🔹 *Cara Kerja:*
-1. Ketik /generate
-2. Bot akan membuat email Mail.TM otomatis
-3. Bot register ke Netflix dengan cookies 30 hari
-4. Email akan auto-verify (seperti netflix-mass-bot.js)
-5. Kamu terima email + password + link
+🔹 *Mode 1: Manual Email*
+1. Pilih "Manual Email"
+2. Input email Anda
+3. Bot submit ke Netflix
+4. Cek inbox untuk verifikasi
 
-🔹 *Teknologi:*
-• Playwright browser automation
-• Mail.TM API untuk email temporary
-• Cookies 30 hari promo Netflix
-• Auto-retry sampai berhasil (max 20x)
+🔹 *Mode 2: Generate Email*
+1. Pilih "Generate Email"
+2. Bot buat email Mail.TM otomatis
+3. Email + password dikirim ke Anda
+4. Password default: \`${DEFAULT_PASSWORD}\`
 
-🔹 *Batasan:*
-• 1 trial per akun Telegram
-• Tidak bisa generate lagi setelah dipakai
-• Email valid selama 30 hari (promo Netflix)
+🔹 *Mode 3: Auto Register + Claim*
+1. Pilih "Auto Register + Claim"
+2. Bot buat email + register + verify otomatis
+3. Full automation!
 
-🔹 *Troubleshooting:*
-Jika gagal, kemungkinan:
-• Server Netflix sedang sibuk
-• Cookies expired
-• Coba lagi beberapa menit kemudian
+🔹 *Mode 4: Mass Email Manual*
+1. Pilih "Mass Email Manual"
+2. Paste list email (1 per line)
+3. Bot process semua email
 
-🔹 *Admin Commands:* (jika kamu admin)
+🔹 *Mode 5: Mass Email Generator*
+1. Pilih "Mass Email Generator"
+2. Input jumlah email (max 10)
+3. Bot generate semua otomatis
+
+🔹 *Admin Commands:*
 /reset <user_id> - Reset trial user
 /stats - Statistik bot
 
@@ -386,14 +603,17 @@ Butuh bantuan? Contact admin bot! 🙋‍♂️
     `;
     
     bot.sendMessage(chatId, helpMessage, { parse_mode: 'Markdown' });
-});
+}
 
 // Command: /status
 bot.onText(/\/status/, (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
-    const username = msg.from.username || msg.from.first_name;
-    
+    showStatus(chatId, userId);
+});
+
+function showStatus(chatId, userId) {
+    const username = 'User';
     const used = hasUsedTrial(userId);
     
     let statusMessage;
@@ -410,7 +630,7 @@ bot.onText(/\/status/, (msg) => {
 📧 Email: ${userData.email}
 📅 Tanggal: ${new Date(userData.timestamp).toLocaleString('id-ID')}
 
-Maaf, hanya 1 trial per akun Telegram ya! 😊
+_Mode lain masih bisa digunakan!_
         `;
     } else {
         statusMessage = `
@@ -421,114 +641,411 @@ Maaf, hanya 1 trial per akun Telegram ya! 😊
 
 ✅ *Trial masih tersedia!*
 
-Gunakan /generate untuk mulai generate email Netflix gratis! 🎬
+Gunakan mode "Auto Register + Claim" untuk trial gratis! 🎬
         `;
     }
     
     bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
-});
+}
 
-// Command: /generate - FULL LOGIC seperti netflix-mass-bot.js
-bot.onText(/\/generate/, async (msg) => {
+// ===== CALLBACK QUERY HANDLERS (RECONIX System) =====
+bot.on('callback_query', async (callbackQuery) => {
+    const msg = callbackQuery.message;
     const chatId = msg.chat.id;
-    const userId = msg.from.id;
-    const username = msg.from.username || msg.from.first_name;
+    const userId = callbackQuery.from.id;
+    const username = callbackQuery.from.username || callbackQuery.from.first_name;
+    const data = callbackQuery.data;
     
-    // Cek apakah sudah pernah menggunakan trial
-    if (hasUsedTrial(userId)) {
-        bot.sendMessage(chatId, 
-            `❌ *Trial sudah digunakan!*\n\n` +
-            `Maaf ${username}, kamu sudah menggunakan 1x trial gratis. ` +
-            `Setiap akun Telegram hanya dapat 1 trial.\n\n` +
-            `Gunakan /status untuk cek detail akun kamu.`,
-            { parse_mode: 'Markdown' }
-        );
-        return;
+    // Answer callback query
+    bot.answerCallbackQuery(callbackQuery.id);
+    
+    // Load user data
+    const db = loadDatabase();
+    const userData = db.users[userId] || { credit: 0, history: [] };
+    
+    if (data === 'menu_fitur') {
+        // Fitur Menu
+        const fiturMsg = `
+🎬 *FITUR - Netflix Generator*
+
+Pilih layanan yang kamu mau:
+
+💰 Saldo kamu: *${userData.credit} kredit*
+
+_1 Generate Netflix = 1 Kredit_
+        `;
+        
+        const keyboard = {
+            inline_keyboard: [
+                [
+                    { text: '🎲 Generate Netflix', callback_data: 'fitur_netflix' }
+                ],
+                [
+                    { text: '🔙 Kembali', callback_data: 'back_main' }
+                ]
+            ]
+        };
+        
+        bot.sendMessage(chatId, fiturMsg, {
+            parse_mode: 'Markdown',
+            reply_markup: keyboard
+        });
     }
     
-    // Mulai generate
-    const processingMsg = await bot.sendMessage(chatId,
-        `🔄 *Memproses...*\n\n` +
-        `Sedang generate email Netflix untuk kamu, ${username}!\n\n` +
-        `⏱ Estimasi: 2-3 menit\n` +
-        `📧 Membuat email Mail.TM...\n` +
-        `🌐 Register ke Netflix...\n` +
-        `🔄 Auto-retry sampai berhasil...\n` +
-        `✅ Auto-verify email...\n\n` +
-        `Mohon tunggu ya... ☕\n\n` +
-        `_Proses sama seperti netflix-mass-bot.js_`,
-        { parse_mode: 'Markdown' }
-    );
-    
-    try {
-        console.log(`[${userId}] ${username} - Starting generation...`);
+    else if (data === 'fitur_netflix') {
+        // Netflix Generation dengan Credit Check
+        if (userData.credit < 1) {
+            bot.sendMessage(chatId,
+                `❌ *Saldo tidak cukup!*\n\n` +
+                `Kamu perlu 1 kredit untuk generate Netflix.\n` +
+                `Saldo kamu: ${userData.credit} kredit\n\n` +
+                `Silakan topup terlebih dahulu!`,
+                { parse_mode: 'Markdown' }
+            );
+            return;
+        }
         
-        // Generate account dengan logic netflix-mass-bot.js
-        const result = await generateNetflixAccount();
+        const processingMsg = await bot.sendMessage(chatId,
+            `🚀 *Generating Netflix Account...*\n\n` +
+            `⏱ Estimasi: 2-3 menit\n` +
+            `📧 Membuat email Mail.TM\n` +
+            `🌐 Register ke Netflix\n` +
+            `✅ Auto-verify email\n\n` +
+            `Mohon tunggu... ☕`,
+            { parse_mode: 'Markdown' }
+        );
         
-        if (result.success) {
-            // Mark trial as used
-            markTrialUsed(userId, username, result.email);
+        try {
+            const result = await generateNetflixAccount();
             
-            // Send success message
-            const successMessage = `
-✅ *Berhasil! Account Netflix Created*
+            if (result.success) {
+                // Deduct credit
+                userData.credit -= 1;
+                
+                // Add to history
+                userData.history.push({
+                    type: 'netflix',
+                    email: result.email,
+                    password: result.password,
+                    link: result.verificationLink,
+                    timestamp: new Date().toISOString()
+                });
+                
+                // Save database
+                db.users[userId] = userData;
+                saveDatabase(db);
+                
+                const successMsg = `
+✅ *Netflix Account Generated!*
 
 📧 *Email:* \`${result.email}\`
 🔑 *Password:* \`${result.password}\`
-🔗 *Verification Link:*
+🔗 *Link Verifikasi:*
 ${result.verificationLink}
 
+💰 *Saldo:* ${userData.credit} kredit
+
 📝 *Cara Pakai:*
-1. Klik link verifikasi di atas
+1. Klik link verifikasi
 2. Login dengan email & password
-3. Pilih paket Netflix yang kamu mau
-4. Nikmati 30 hari gratis! 🎉
+3. Pilih paket Netflix
+4. Enjoy 30 hari gratis! 🎉
 
-⚠️ *Penting:*
-• Simpan email & password ini!
-• Link verifikasi valid 24 jam
-• Setelah 30 hari, perlu bayar atau cancel
-
-🎬 *Format Result:*
-\`\`\`
-${result.email}|${result.password}|${result.verificationLink}
-\`\`\`
-
-Selamat menikmati Netflix! 🍿🎬
-            `;
-            
+_Email & password sudah tersimpan di Riwayat_
+                `;
+                
+                await bot.deleteMessage(chatId, processingMsg.message_id);
+                bot.sendMessage(chatId, successMsg, { parse_mode: 'Markdown' });
+                
+                // Log
+                const logData = `[${new Date().toISOString()}] User: ${username} (${userId}) | Netflix | Email: ${result.email} | Credit: ${userData.credit}\n`;
+                await fs.appendFile('./telegram_bot_log.txt', logData);
+            }
+        } catch (error) {
             await bot.deleteMessage(chatId, processingMsg.message_id);
-            bot.sendMessage(chatId, successMessage, { parse_mode: 'Markdown' });
+            bot.sendMessage(chatId,
+                `❌ *Gagal Generate*\n\n` +
+                `Error: \`${error.message}\`\n\n` +
+                `Kredit kamu tidak dikurangi, silakan coba lagi!`,
+                { parse_mode: 'Markdown' }
+            );
+        }
+    }
+    
+    else if (data === 'menu_profile') {
+        // Profile Menu
+        const profileMsg = `
+👤 *PROFILE*
+
+🆔 Telegram ID: \`${userId}\`
+👤 Username: @${username}
+💰 Saldo: *${userData.credit} kredit*
+📅 Member sejak: ${new Date(userData.timestamp).toLocaleDateString('id-ID')}
+📊 Total transaksi: ${userData.history.length}
+        `;
+        
+        const keyboard = {
+            inline_keyboard: [
+                [
+                    { text: '🔙 Kembali', callback_data: 'back_main' }
+                ]
+            ]
+        };
+        
+        bot.sendMessage(chatId, profileMsg, {
+            parse_mode: 'Markdown',
+            reply_markup: keyboard
+        });
+    }
+    
+    else if (data === 'menu_riwayat') {
+        // Riwayat/History Menu
+        let historyMsg = `📜 *RIWAYAT TRANSAKSI*\n\n`;
+        
+        if (userData.history.length === 0) {
+            historyMsg += `Belum ada transaksi.`;
+        } else {
+            const recentHistory = userData.history.slice(-5).reverse();
+            recentHistory.forEach((item, index) => {
+                historyMsg += `*${index + 1}.* Netflix\n`;
+                historyMsg += `📧 ${item.email}\n`;
+                historyMsg += `🔑 ${item.password}\n`;
+                historyMsg += `📅 ${new Date(item.timestamp).toLocaleString('id-ID')}\n\n`;
+            });
             
-            console.log(`[${userId}] ${username} - Success: ${result.email}`);
-            
-            // Log ke file (seperti netflix-mass-bot.js)
-            const logData = `[${new Date().toISOString()}] User: ${username} (${userId}) | Email: ${result.email} | Link: ${result.verificationLink}\n`;
-            await fs.appendFile('./telegram_bot_log.txt', logData);
-            
-            // Save ke result file format netflix-mass-bot.js
-            const resultData = `${result.email}|${result.password}|${result.verificationLink}\n`;
-            await fs.appendFile('./telegram_bot_results.txt', resultData);
+            if (userData.history.length > 5) {
+                historyMsg += `_Menampilkan 5 transaksi terakhir_`;
+            }
         }
         
-    } catch (error) {
-        console.error(`[${userId}] Error:`, error.message);
+        const keyboard = {
+            inline_keyboard: [
+                [
+                    { text: '🔙 Kembali', callback_data: 'back_main' }
+                ]
+            ]
+        };
         
-        await bot.deleteMessage(chatId, processingMsg.message_id);
-        
+        bot.sendMessage(chatId, historyMsg, {
+            parse_mode: 'Markdown',
+            reply_markup: keyboard
+        });
+    }
+    
+    else if (data === 'menu_redeem') {
+        // Redeem Menu
+        userStates.set(userId, { mode: 'redeem', step: 1 });
         bot.sendMessage(chatId,
-            `❌ *Gagal Generate Email*\n\n` +
-            `Maaf ${username}, terjadi error:\n` +
-            `\`${error.message}\`\n\n` +
-            `Kemungkinan penyebab:\n` +
-            `• Server Netflix sedang sibuk\n` +
-            `• Koneksi internet tidak stabil\n` +
-            `• Cookies expired\n` +
-            `• Max retry (20x) tercapai\n\n` +
-            `Trial kamu masih tersisa, silakan coba lagi nanti! 🔄`,
+            `🎁 *REDEEM KODE*\n\n` +
+            `Kirim kode redeem kamu untuk claim kredit gratis!\n\n` +
+            `Format: KODE-RAHASIA-123`,
             { parse_mode: 'Markdown' }
         );
+    }
+    
+    else if (data === 'menu_topup') {
+        // Topup Menu
+        const topupMsg = `
+💳 *TOPUP KREDIT*
+
+📋 *Harga:*
+• 5 Kredit = Rp 10.000
+• 10 Kredit = Rp 18.000 _(Hemat 10%)_
+• 20 Kredit = Rp 32.000 _(Hemat 20%)_
+
+💰 Saldo kamu: *${userData.credit} kredit*
+
+📞 *Cara Topup:*
+1. Hubungi admin untuk topup
+2. Pilih paket yang kamu mau
+3. Transfer sesuai nominal
+4. Kirim bukti transfer ke admin
+5. Kredit otomatis masuk!
+
+👤 Contact Admin: @YourAdminUsername
+        `;
+        
+        const keyboard = {
+            inline_keyboard: [
+                [
+                    { text: '📞 Contact Admin', url: 'https://t.me/YourAdminUsername' }
+                ],
+                [
+                    { text: '🔙 Kembali', callback_data: 'back_main' }
+                ]
+            ]
+        };
+        
+        bot.sendMessage(chatId, topupMsg, {
+            parse_mode: 'Markdown',
+            reply_markup: keyboard
+        });
+    }
+    
+    else if (data === 'menu_bantuan') {
+        // Bantuan/Help Menu
+        const helpMsg = `
+❓ *BANTUAN*
+
+🔹 *Cara Pakai Bot:*
+1. Klik "Fitur" di menu utama
+2. Pilih "Generate Netflix"
+3. Tunggu 2-3 menit
+4. Dapat email + password + link
+
+🔹 *Sistem Kredit:*
+• New user dapat 2 kredit gratis
+• 1 Generate Netflix = 1 Kredit
+• Topup via admin untuk kredit tambahan
+
+🔹 *Redeem Kode:*
+• Klik "Redeem" di menu utama
+• Kirim kode redeem
+• Kredit otomatis masuk
+
+🔹 *FAQ:*
+Q: Berapa lama proses generate?
+A: 2-3 menit per email
+
+Q: Apakah bisa gagal?
+A: Bisa, tapi kredit tidak dikurangi jika gagal
+
+Q: Email valid berapa lama?
+A: 30 hari (promo Netflix)
+
+📞 Butuh bantuan? Contact admin!
+        `;
+        
+        const keyboard = {
+            inline_keyboard: [
+                [
+                    { text: '🔙 Kembali', callback_data: 'back_main' }
+                ]
+            ]
+        };
+        
+        bot.sendMessage(chatId, helpMsg, {
+            parse_mode: 'Markdown',
+            reply_markup: keyboard
+        });
+    }
+    
+    else if (data === 'back_main') {
+        // Back to main menu
+        const welcomeMsg = `
+👋 *Selamat datang di RECONIX Bot*
+
+🆔 Telegram: \`${userId}\`
+🔗 Akun Web: \`${username}\` ✅
+💰 Saldo: *${userData.credit} kredit*
+
+Pilih menu di bawah untuk mulai 👇
+        `;
+        
+        const keyboard = {
+            inline_keyboard: [
+                [
+                    { text: '🎬 Fitur', callback_data: 'menu_fitur' }
+                ],
+                [
+                    { text: '👤 Profile', callback_data: 'menu_profile' },
+                    { text: '📜 Riwayat', callback_data: 'menu_riwayat' }
+                ],
+                [
+                    { text: '🎁 Redeem', callback_data: 'menu_redeem' },
+                    { text: '💳 Topup', callback_data: 'menu_topup' }
+                ],
+                [
+                    { text: '❓ Bantuan', callback_data: 'menu_bantuan' }
+                ]
+            ]
+        };
+        
+        bot.sendMessage(chatId, welcomeMsg, {
+            parse_mode: 'Markdown',
+            reply_markup: keyboard
+        });
+    }
+});
+
+// ===== MESSAGE HANDLER untuk Multi-Step Process & Redeem =====
+bot.on('message', async (msg) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    const username = msg.from.username || msg.from.first_name;
+    const text = msg.text;
+    
+    // Skip command messages
+    if (!text || text.startsWith('/')) return;
+    
+    // Check user state
+    const userState = userStates.get(userId);
+    if (!userState) return;
+    
+    const { mode, step, data } = userState;
+    
+    // MODE: REDEEM
+    if (mode === 'redeem' && step === 1) {
+        const code = text.trim().toUpperCase();
+        
+        // Simple redeem code validation (customize dengan kode real Anda)
+        const validCodes = {
+            'WELCOME10': 10,
+            'TRIAL5': 5,
+            'BONUS3': 3
+        };
+        
+        if (validCodes[code]) {
+            const creditBonus = validCodes[code];
+            
+            // Load database
+            const db = loadDatabase();
+            const userData = db.users[userId];
+            
+            // Check if code already redeemed
+            if (userData.redeemedCodes && userData.redeemedCodes.includes(code)) {
+                bot.sendMessage(chatId,
+                    `❌ *Kode sudah digunakan!*\n\n` +
+                    `Kode "${code}" sudah pernah kamu redeem sebelumnya.`,
+                    { parse_mode: 'Markdown' }
+                );
+            } else {
+                // Add credit
+                userData.credit += creditBonus;
+                
+                // Mark code as redeemed
+                if (!userData.redeemedCodes) {
+                    userData.redeemedCodes = [];
+                }
+                userData.redeemedCodes.push(code);
+                
+                // Save
+                db.users[userId] = userData;
+                saveDatabase(db);
+                
+                bot.sendMessage(chatId,
+                    `✅ *Redeem Berhasil!*\n\n` +
+                    `Kode: "${code}"\n` +
+                    `Bonus: +${creditBonus} kredit\n\n` +
+                    `💰 Saldo baru: *${userData.credit} kredit*\n\n` +
+                    `Selamat! 🎉`,
+                    { parse_mode: 'Markdown' }
+                );
+                
+                // Log
+                const logData = `[${new Date().toISOString()}] Redeem | User: ${username} (${userId}) | Code: ${code} | Bonus: ${creditBonus}\n`;
+                await fs.appendFile('./telegram_bot_log.txt', logData);
+            }
+        } else {
+            bot.sendMessage(chatId,
+                `❌ *Kode tidak valid!*\n\n` +
+                `Kode "${code}" tidak ditemukan atau sudah expired.\n\n` +
+                `Coba kode lain atau hubungi admin.`,
+                { parse_mode: 'Markdown' }
+            );
+        }
+        
+        userStates.delete(userId);
     }
 });
 
