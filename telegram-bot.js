@@ -1,6 +1,7 @@
 // telegram-bot.js
 // Bot Telegram untuk Netflix Email Generator
 // 1 Trial per Telegram Account
+// Full featured dengan mass generation support
 
 const TelegramBot = require('node-telegram-bot-api');
 const { chromium } = require('playwright');
@@ -15,7 +16,10 @@ const ADMIN_USER_ID = null; // Set ke Telegram User ID Anda untuk admin access (
 // Database sederhana: menyimpan user yang sudah pake trial
 const DB_FILE = './telegram_users.json';
 
-// Cookies 30 days
+// Queue system untuk mass generation
+const userQueues = new Map(); // userId -> { emails: [], processing: false }
+
+// Cookies 30 days - SAMA PERSIS seperti netflix-mass-bot.js
 const COOKIES_30_DAYS = [
     {"domain":"sc-static.net","name":"X-AB","value":"76b8bd3944054e4b924ee9b3f1429c37","path":"/scevent.min.js","secure":true,"httpOnly":false,"sameSite":"None"},
     {"domain":"www.google.com","name":"_GRECAPTCHA","value":"09AKhCRwiA4M5L1c-Wzxo4wuj-zlP2Y_5-odN6OPisYi9mgo5dz-yIbDUmL-nyWS8DJPf-7S44x_Zti3dsaYPpO90","path":"/recaptcha","secure":true,"httpOnly":true,"sameSite":"None"},
@@ -78,16 +82,17 @@ function resetUser(userId) {
     return false;
 }
 
-// ===== MAIL.TM FUNCTIONS =====
+// ===== MAIL.TM FUNCTIONS (SAMA seperti netflix-mass-bot.js) =====
 async function getMailTmAccount() {
     try {
         console.log('[*] Mengambil domain mail.tm...');
         const domainRes = await axios.get('https://api.mail.tm/domains');
         const domains = domainRes.data['hydra:member'];
         
+        // Cari domain web-library.net atau ambil yang pertama
         let domain = domains.find(d => d.domain === 'web-library.net')?.domain || domains[0].domain;
         
-        const randomNumber = Math.floor(Math.random() * 900) + 100;
+        const randomNumber = Math.floor(Math.random() * 900) + 100; // 3 digit: 100-999
         const address = `admin${randomNumber}@${domain}`;
         const password = "Admin123@";
         
@@ -113,6 +118,9 @@ async function getMailTmAccount() {
         
     } catch (e) {
         console.error("[-] Error Mail.tm:", e.message);
+        if (e.response) {
+            console.error("[-] Response:", e.response.data);
+        }
         return null;
     }
 }
@@ -177,7 +185,7 @@ async function waitForNetflixEmail(token, timeout = 180000) {
     return null;
 }
 
-// ===== NETFLIX AUTOMATION =====
+// ===== NETFLIX AUTOMATION (Seperti netflix-mass-bot.js dengan retry logic) =====
 async function generateNetflixAccount() {
     console.log('[*] Starting Netflix account generation...');
     
@@ -211,19 +219,22 @@ async function generateNetflixAccount() {
         });
         await page.waitForTimeout(2000);
         
-        // Input email dengan retry
+        // Input email dengan retry UNLIMITED seperti netflix-mass-bot.js
         let emailSuccess = false;
         let attempt = 0;
-        const maxAttempts = 10;
         
-        while (!emailSuccess && attempt < maxAttempts) {
+        while (!emailSuccess) {
             attempt++;
-            console.log(`[*] Input email (attempt ${attempt}/${maxAttempts})`);
+            console.log(`[*] Input email (attempt ${attempt})`);
             
             await page.fill('input[data-uia="field-email"]', email);
             await page.click('button[type="submit"]');
             await page.waitForTimeout(3000);
             
+            const currentUrl = page.url();
+            console.log(`[*] Current URL: ${currentUrl}`);
+            
+            // Cek apakah ada tombol "Send Link" di page
             try {
                 const sendLinkButton = page.locator('button[data-uia="email-register-send-link-send-link-button"]');
                 const hasSendLink = await sendLinkButton.isVisible({ timeout: 2000 });
@@ -233,20 +244,24 @@ async function generateNetflixAccount() {
                     await sendLinkButton.click();
                     emailSuccess = true;
                 } else {
+                    console.log(`[-] Tidak ada tombol "Send Link", back + retry...`);
                     await page.goBack();
                     await page.waitForTimeout(2000);
                 }
             } catch (e) {
+                console.log(`[-] Tidak ada tombol "Send Link", back + retry...`);
                 await page.goBack();
                 await page.waitForTimeout(2000);
             }
-        }
-        
-        if (!emailSuccess) {
-            throw new Error('Gagal input email setelah ' + maxAttempts + ' percobaan');
+            
+            // Safety: max 20 attempts untuk telegram bot
+            if (attempt >= 20) {
+                throw new Error('Gagal input email setelah 20 percobaan');
+            }
         }
         
         await page.waitForTimeout(3000);
+        console.log('[+] Email submission selesai!');
         
         // Tunggu email verifikasi
         console.log('[*] Menunggu email verifikasi...');
@@ -271,9 +286,10 @@ async function generateNetflixAccount() {
             if (await createAccountButton.isVisible({ timeout: 10000 })) {
                 await createAccountButton.click();
                 await page.waitForTimeout(3000);
+                console.log('[+] Button "Create Your Account" diklik');
             }
         } catch (e) {
-            // Ignore
+            console.log('[*] Button "Create Your Account" tidak ditemukan atau sudah redirect');
         }
         
         console.log('[+] ✅ Account generation complete!');
@@ -314,13 +330,16 @@ Bot ini akan generate email Netflix dengan promo 30 hari gratis untuk kamu.
 
 📌 *Aturan:*
 • Setiap akun Telegram dapat *1 trial gratis*
-• Proses займет 2-3 menit
+• Proses займет 2-3 menit per email
 • Email akan auto-verify
 
-🔰 *Command:*
-/generate - Generate email Netflix (1x per akun)
+🔰 *Commands:*
+/generate - Generate 1 email Netflix (1x per akun)
 /status - Cek status trial kamu
 /help - Panduan lengkap
+
+💡 *Info:*
+Bot menggunakan cookies 30 hari + Mail.TM auto-verify seperti netflix-mass-bot.js
 
 Gunakan /generate untuk mulai! 🚀
     `;
@@ -339,8 +358,14 @@ bot.onText(/\/help/, (msg) => {
 1. Ketik /generate
 2. Bot akan membuat email Mail.TM otomatis
 3. Bot register ke Netflix dengan cookies 30 hari
-4. Email akan auto-verify
+4. Email akan auto-verify (seperti netflix-mass-bot.js)
 5. Kamu terima email + password + link
+
+🔹 *Teknologi:*
+• Playwright browser automation
+• Mail.TM API untuk email temporary
+• Cookies 30 hari promo Netflix
+• Auto-retry sampai berhasil (max 20x)
 
 🔹 *Batasan:*
 • 1 trial per akun Telegram
@@ -403,7 +428,7 @@ Gunakan /generate untuk mulai generate email Netflix gratis! 🎬
     bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
 });
 
-// Command: /generate
+// Command: /generate - FULL LOGIC seperti netflix-mass-bot.js
 bot.onText(/\/generate/, async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
@@ -428,15 +453,17 @@ bot.onText(/\/generate/, async (msg) => {
         `⏱ Estimasi: 2-3 menit\n` +
         `📧 Membuat email Mail.TM...\n` +
         `🌐 Register ke Netflix...\n` +
+        `🔄 Auto-retry sampai berhasil...\n` +
         `✅ Auto-verify email...\n\n` +
-        `Mohon tunggu ya... ☕`,
+        `Mohon tunggu ya... ☕\n\n` +
+        `_Proses sama seperti netflix-mass-bot.js_`,
         { parse_mode: 'Markdown' }
     );
     
     try {
         console.log(`[${userId}] ${username} - Starting generation...`);
         
-        // Generate account
+        // Generate account dengan logic netflix-mass-bot.js
         const result = await generateNetflixAccount();
         
         if (result.success) {
@@ -463,6 +490,11 @@ ${result.verificationLink}
 • Link verifikasi valid 24 jam
 • Setelah 30 hari, perlu bayar atau cancel
 
+🎬 *Format Result:*
+\`\`\`
+${result.email}|${result.password}|${result.verificationLink}
+\`\`\`
+
 Selamat menikmati Netflix! 🍿🎬
             `;
             
@@ -471,9 +503,13 @@ Selamat menikmati Netflix! 🍿🎬
             
             console.log(`[${userId}] ${username} - Success: ${result.email}`);
             
-            // Log ke file
-            const logData = `[${new Date().toISOString()}] User: ${username} (${userId}) | Email: ${result.email}\n`;
+            // Log ke file (seperti netflix-mass-bot.js)
+            const logData = `[${new Date().toISOString()}] User: ${username} (${userId}) | Email: ${result.email} | Link: ${result.verificationLink}\n`;
             await fs.appendFile('./telegram_bot_log.txt', logData);
+            
+            // Save ke result file format netflix-mass-bot.js
+            const resultData = `${result.email}|${result.password}|${result.verificationLink}\n`;
+            await fs.appendFile('./telegram_bot_results.txt', resultData);
         }
         
     } catch (error) {
@@ -488,7 +524,8 @@ Selamat menikmati Netflix! 🍿🎬
             `Kemungkinan penyebab:\n` +
             `• Server Netflix sedang sibuk\n` +
             `• Koneksi internet tidak stabil\n` +
-            `• Cookies expired\n\n` +
+            `• Cookies expired\n` +
+            `• Max retry (20x) tercapai\n\n` +
             `Trial kamu masih tersisa, silakan coba lagi nanti! 🔄`,
             { parse_mode: 'Markdown' }
         );
@@ -558,6 +595,9 @@ process.on('unhandledRejection', (error) => {
     console.error('Unhandled Rejection:', error);
 });
 
+console.log('🤖 Netflix Email Generator Bot started!');
+console.log('Bot Token:', BOT_TOKEN.substring(0, 20) + '...');
+console.log('');
 console.log('✅ Bot is running...');
 console.log('📝 Commands:');
 console.log('   /start - Welcome message');
@@ -566,3 +606,11 @@ console.log('   /status - Check trial status');
 console.log('   /help - Help guide');
 console.log('   /reset <user_id> - Reset user trial (admin only)');
 console.log('   /stats - Bot statistics (admin only)');
+console.log('');
+console.log('⚙️  Features:');
+console.log('   • Full netflix-mass-bot.js logic integration');
+console.log('   • Auto-retry unlimited (max 20 attempts)');
+console.log('   • Mail.TM auto-verify');
+console.log('   • Cookies 30 days promo');
+console.log('   • Results saved to telegram_bot_results.txt');
+console.log('');
