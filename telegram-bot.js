@@ -12,7 +12,7 @@ const mysql = require('mysql2/promise');
 
 // ===== KONFIGURASI =====
 const BOT_TOKEN = '8557661156:AAG49v40J15F140lI4CAba8Ypx0E_uy8_M8';
-const ADMIN_USER_ID = null; // Set ke Telegram User ID Anda untuk admin access (optional)
+const ADMIN_USER_ID = 6490037175; // Set ke Telegram User ID Anda untuk admin access (optional)
 const DEFAULT_PASSWORD = 'NetflixTrial2025!'; // Password default untuk mode generate
 
 // MySQL Database Configuration
